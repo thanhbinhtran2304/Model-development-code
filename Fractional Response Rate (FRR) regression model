@@ -1,1 +1,96 @@
 
+%macro Rel_Weight_FRR(input=, indep_vars=);
+	%let featureNumber=%sysfunc(countw(&indep_vars. , " "));
+	%put &featureNumber.;
+
+
+	%do t=1 %to &featureNumber.;
+		%let variable&t.=%scan(&indep_vars.,&t.," ");
+	%end;
+
+	Proc sql noprint;
+		select 1
+
+			%do t= 1 %to &featureNumber.;
+				,avg(&&variable&t..)
+				,std(&&variable&t..)
+			%end;
+
+into:
+		one
+
+			%do t=1 %to &featureNumber;
+				,:avg_&t.
+				,:std_&t.
+			%end;
+
+		from &input._DEV;
+	quit;
+
+	data temp_rw;
+		set &input._DEV;
+
+		%do t=1 %to &featureNumber;
+			&&variable&t..=(&&variable&t..-&&avg_&t..)/&&std_&t..;
+		%end;
+	run;
+
+	proc Reg noprint data=temp_rw outest=temp_rw_pe;
+		model Tar_lgd=
+			%do t=1 %to &featureNumber.;
+		&&variable&t..
+		%end;
+		;
+	run;
+
+	proc Transpose data= temp_rw_pe (drop=_MODEL_ _TYPE_ _DEPVAR_ _RMSE_ Tar_LGD)
+		out=temp_rw_pe_t (drop=_LABEL_);
+	run;
+
+	data temp_rw_pe_t;
+		set temp_rw_pe_t;
+		n= "m"||strip(_n_-1);
+		call symput(n,COL1);
+	run;
+
+	proc Nlmixed data=temp_rw method=gauss tech=quanew maxiter=3000 maxfunc=3000 qtol=0.0001;
+		parms
+			m0=&m0.
+
+			%do t= 1 %to &featureNumber.;
+				m&t.=&&m&t..
+			%end;
+		;
+		cov_mu=m0
+
+			%do t= 1 %to &featureNumber.;
+				+ (m&t.*&&variable&t..)
+			%end;
+		;
+		mu=logistic(cov_mu);
+		loglikefun=Tar_LGD*log(mu)+(1-Tar_LGD)*log(1-mu);
+		model Tar_LGD~general(loglikefun);
+		PREDICT MU OUT=MU_RESULTS;
+		ods output parameterestimates=parmest FitStatistics=FitS;
+	run;
+
+	proc sql;
+		create table paramest1 as
+			select a._NAME_,b.Estimate, b.probt from temp_rw_pe_t a 
+				left join parmest b on a.n=b.Parameter
+					where a._NAME_ ne 'Intercept';
+	quit;
+
+	proc sql noprint;
+		select sum(abs(Estimate)) into: sum_EST from paramest1;
+	quit;
+
+	data &input._rel_weight (keep= Variable Estimate rel_weight);
+		retain Variable;
+		set paramest1;
+		rel_weight= abs(Estimate)/&sum_Est.;
+		Variable=_NAME_;
+	run;
+
+
+%mend Rel_Weight_FRR;
