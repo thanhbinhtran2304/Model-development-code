@@ -3,11 +3,11 @@
 	%let featureNumber=%sysfunc(countw(&indep_vars. , " "));
 	%put &featureNumber.;
 
-
+/* step 1: Extracting Each Independent Variable */
 	%do t=1 %to &featureNumber.;
 		%let variable&t.=%scan(&indep_vars.,&t.," ");
 	%end;
-
+/* step 2: Calculate Averages and Standard Deviations for each independent variables */
 	Proc sql noprint;
 		select 1
 
@@ -26,7 +26,7 @@ into:
 
 		from &input._DEV;
 	quit;
-
+/* step 3: Standardizing the independent variables */
 	data temp_rw;
 		set &input._DEV;
 
@@ -35,6 +35,7 @@ into:
 		%end;
 	run;
 
+/* step 4: Running the Regression Model with depedent variable: target_LGD with above standardized indepedent variables */
 	proc Reg noprint data=temp_rw outest=temp_rw_pe;
 		model Tar_lgd=
 			%do t=1 %to &featureNumber.;
@@ -43,17 +44,18 @@ into:
 		;
 	run;
 
+/* Transposing the Parameter Estimates */
 	proc Transpose data= temp_rw_pe (drop=_MODEL_ _TYPE_ _DEPVAR_ _RMSE_ Tar_LGD)
 		out=temp_rw_pe_t (drop=_LABEL_);
 	run;
-
+/* Storing Parameters in Macro Variables */
 	data temp_rw_pe_t;
 		set temp_rw_pe_t;
 		n= "m"||strip(_n_-1);
 		call symput(n,COL1);
 	run;
-
-	proc Nlmixed data=temp_rw method=gauss tech=quanew maxiter=3000 maxfunc=3000 qtol=0.0001;
+/* step 5: Maximum Likelihood Estimation */
+	proc Nlmixed data=temp_rw method=gauss tech=quanew maxiter=3000 maxfunc=3000 qtol=0.0001; /*Performs nonlinear mixed-effects modeling using the Gaussian method.*/
 		parms
 			m0=&m0.
 
@@ -61,15 +63,31 @@ into:
 				m&t.=&&m&t..
 			%end;
 		;
+/*constructs the linear predictor, which is the linear combination of the independent variables and their corresponding coefficients.
+m0: This is the intercept term.
+m&t.*&&variable&t..: For each independent variable, the corresponding coefficient (m&t.) is multiplied by the standardized variable (&&variable&t..).
+The loop iterates over each independent variable, summing up the contributions of each variable to form the linear predictor cov_mu.*/
 		cov_mu=m0
 
 			%do t= 1 %to &featureNumber.;
 				+ (m&t.*&&variable&t..)
 			%end;
 		;
+/* Applying the Logistic Function */
 		mu=logistic(cov_mu);
-		loglikefun=Tar_LGD*log(mu)+(1-Tar_LGD)*log(1-mu);
+/* mu=logistic(cov_mu);: The linear predictor cov_mu is transformed using the logistic function. This step converts the linear combination of predictors into a probability, mu, which is constrained between 0 and 1. The logistic function is defined as: mu = 1/(1+ e^(-cov_mu))*/
+​
+ 
+
+		loglikefun=Tar_LGD*log(mu)+(1-Tar_LGD)*log(1-mu); /* log-likelihood function for a fractional response model */
+/*NOTE (this is for binary outcome only: Tar_LGD is the observed binary outcome (0 or 1).
+log(mu) is the log of the predicted probability that Tar_LGD is 1.
+log(1-mu) is the log of the predicted probability that Tar_LGD is 0.
+The log-likelihood for each observation is Tar_LGD * log(mu) + (1 - Tar_LGD) * log(1 - mu). The overall log-likelihood is the sum of these individual log-likelihoods across all observations. MLE aims to maximize this sum.*/
+
 		model Tar_LGD~general(loglikefun);
+/*This specifies that the model is to be fit by maximizing the general log-likelihood function (loglikefun). The ~general syntax tells SAS that the response variable (Tar_LGD) follows a general distribution described by the log-likelihood function provided.*/
+
 		PREDICT MU OUT=MU_RESULTS;
 		ods output parameterestimates=parmest FitStatistics=FitS;
 	run;
@@ -80,7 +98,7 @@ into:
 				left join parmest b on a.n=b.Parameter
 					where a._NAME_ ne 'Intercept';
 	quit;
-
+/* step 6: Calculating Relative Weights of each variables */ 
 	proc sql noprint;
 		select sum(abs(Estimate)) into: sum_EST from paramest1;
 	quit;
@@ -94,3 +112,37 @@ into:
 
 
 %mend Rel_Weight_FRR;
+
+1. Log-Likelihood Function for Binary Logistic Regression
+In binary logistic regression, where the dependent variable is binary (0 or 1), the log-likelihood function is as follows:
+
+sas
+Copy code
+loglikefun = Tar_LGD * log(mu) + (1 - Tar_LGD) * log(1 - mu);
+Tar_LGD: This represents the observed binary outcome (0 or 1).
+mu: This is the predicted probability that the outcome is 1 (i.e., the logistic function applied to the linear predictor).
+log(mu): The log of the predicted probability when the actual outcome is 1.
+log(1 - mu): The log of the predicted probability when the actual outcome is 0.
+The term Tar_LGD * log(mu) contributes to the log-likelihood when the observed outcome is 1.
+The term (1 - Tar_LGD) * log(1 - mu) contributes to the log-likelihood when the observed outcome is 0.
+The sum of these terms across all observations forms the overall log-likelihood that the MLE procedure seeks to maximize.
+
+2. Log-Likelihood Function for a Fractional Response Model (FRM)
+In a Fractional Response Model (FRM), the dependent variable can be any value between 0 and 1 (not just 0 or 1), representing a proportion or fraction. The log-likelihood function for an FRM, assuming the use of the logistic link function, can still look similar but with different interpretations:
+
+sas
+Copy code
+loglikefun = Tar_LGD * log(mu) + (1 - Tar_LGD) * log(1 - mu);
+Tar_LGD: This now represents the observed proportion or fraction, which can take any value between 0 and 1.
+mu: This is the predicted value from the model, which represents the expected proportion (also between 0 and 1).
+log(mu): The log of the predicted proportion.
+log(1 - mu): The log of the predicted complement of the proportion (i.e., the fraction of the outcome that is not accounted for by mu).
+For each observation, the log-likelihood contributes a term that accounts for how well the predicted mu matches the actual observed proportion Tar_LGD. The function sums these contributions across all observations to form the overall log-likelihood.
+
+Correction and Clarification:
+Binary Logistic Regression: The log-likelihood is based on the binary nature of the outcome (0 or 1), with terms that reflect whether the predicted probability correctly predicts the binary outcome.
+
+Fractional Response Model: The log-likelihood is based on the actual observed proportions, with terms reflecting how closely the predicted mu matches these proportions. The form of the function is similar, but it applies to continuous fractional data rather than strictly binary data.
+
+Conclusion
+While the form of the log-likelihood function (Tar_LGD * log(mu) + (1 - Tar_LGD) * log(1 - mu)) can be used in both logistic regression and FRM, the key difference lies in the nature of the dependent variable (Tar_LGD). In logistic regression, it's binary, whereas in an FRM, it's a continuous fraction or proportion. The log-likelihood in an FRM reflects the likelihood of observing the given fractions, rather than the binary outcomes.
