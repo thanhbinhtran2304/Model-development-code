@@ -444,3 +444,49 @@ quit;
 proc sql;drop table EBSMOD.LGD_MOD_STEP1;
 
 /*#################################### end #################################*/
+
+The two rounds of stratified sampling in the code serve different purposes and target different subsets of the data. Here's why they are both necessary:
+
+1. First Stratified Sampling (General Holdout Sample)
+Purpose: This sampling is done on the entire perf_obs_point dataset to create a general holdout set across all observations that meet the initial filtering criteria (lgd_default_ind = 0 and OBS_LGD_MODEL_RES = 1).
+Stratification Variables: The stratification is based on time_sk and SEG_PDH_BTL_IND.
+Outcome: This results in the creation of sample_data_perf, which is used to mark certain observations in perf_obs_point as part of the holdout set (perf_obs_point_holdout).
+Reason: This ensures that the holdout sample is representative across different time points (time_sk) and segmentation (SEG_PDH_BTL_IND) variables, maintaining the overall distribution of the data in the holdout set.
+2. Second Stratified Sampling (Segment-Specific Holdout Sample)
+Purpose: This sampling focuses on creating holdout samples specifically for the PDH (Private Dwelling House) and EVENT segments. These segments are important for modeling purposes and need to be treated separately.
+Stratification Variables: The stratification here is based on yrs_to_resolution_adj, which is the adjusted years to resolution. This variable is crucial because it reflects the time until the resolution of default, an important factor in LGD modeling.
+Outcome: The resulting samples (sample_data_pdh and sample_data_evt) help identify holdout cases within the PDH and EVENT segments.
+Reason: This step ensures that the holdout sample is not only representative in terms of the overall population but also specifically tailored to the PDH and EVENT segments. By stratifying on yrs_to_resolution_adj, the model can later account for differences in the timing of default resolution within these critical segments.
+Why Two Separate Samplings?
+Different Stratification Needs: The first sampling addresses the overall dataset, ensuring general representativeness across time and segmentation. The second round focuses on specific segments (PDH and EVENT), with stratification on a different variable (yrs_to_resolution_adj), which is more relevant to these segments.
+
+Modeling Focus: The second sampling is particularly important because PDH and EVENT segments might have different characteristics and risks that need to be captured separately. Creating holdout samples specifically for these segments ensures that the model is validated in a way that reflects these differences.
+
+Data Integrity: By performing these stratified samplings separately, the code ensures that each segment (both overall and specific) is properly represented in the holdout data, which is crucial for reliable model validation and performance assessment.
+
+so will 1 observation might belong to 2 holdout dataset 
+ChatGPT
+No, an observation will not belong to two different holdout datasets. Here's why:
+
+Handling of Overlapping Observations
+The code ensures that each observation is assigned to only one holdout dataset through the following mechanisms:
+
+Initial Sampling (General Holdout Sample):
+
+The first stratified sampling on perf_obs_point creates a general holdout sample. Observations selected in this step are marked with a holdout_flag in perf_obs_point_holdout.
+Segment-Specific Sampling (PDH and EVENT):
+
+The second round of sampling targets specific segments (PDH and EVENT) and is performed on datasets (input_data_pdh and input_data_evt) created separately for these segments.
+After this sampling, sample_data_pdh and sample_data_evt are created to identify holdout samples within these specific segments.
+Combining Holdout Indicators:
+
+In the final proc sql step where the holdout_ind table is created, the code uses CASE statements to determine the holdout_ind value:
+If an observation belongs to the PDH segment and is in sample_data_pdh, it gets a holdout_ind of 1.
+If an observation belongs to the EVENT segment and is in sample_data_evt, it also gets a holdout_ind of 1.
+If an observation is in the general holdout set (perf_obs_point_holdout), it gets a holdout_ind of 1.
+Otherwise, the holdout_ind is set to 0.
+Ensuring No Overlaps
+The code combines these holdout flags carefully to ensure that an observation is not duplicated across different holdout sets.
+If an observation was already marked as a holdout in the general holdout set and then appears in a segment-specific holdout set, it is still marked as part of a holdout only once.
+The final dataset combines these flags, but each observation has only one holdout_ind, which will be 1 if it is in any of the holdout sets, and 0 otherwise.
+Summary: The design of the code and the final holdout_ind creation ensures that each observation is uniquely assigned to a holdout dataset if selected, preventing any observation from belonging to more than one holdout dataset.
