@@ -1,0 +1,446 @@
+/*This Programme does the following 
+1.Creates HOLDOUT SET FOR PDH and EVENT  but not for BTL as it is out of modelling scope
+2.Creates SEG_LGD and the final modelling dataset
+*/
+
+
+
+%macro dummy; %mend dummy;
+
+
+proc sql;
+create table perf_obs_point as 
+select
+	a.time_sk 
+	,a.account_rk
+	,a.lgd_default_ind
+	,a.LGD_DEF_N12M_IND	
+	,a.real_lgd_mod_nxt_def as rlgd_at_dflt
+	,a.SEG_PDH_BTL_IND
+	,a.x_app_index_ltv_adj
+	,a.LGD_BALANCE_EUR_AMT
+	,a.mtg_type
+from &m_data_in. as a
+
+where 1=1
+	and a.lgd_default_ind = 0
+	and OBS_LGD_MODEL_RES = 1
+
+order by a.time_sk, a.SEG_PDH_BTL_IND, a.account_rk
+;
+quit;
+
+/*STEP2: prepare strata for sampling*/
+proc sql;
+select 	
+cases_holdout into :cases_holdout_perf separated by ' '	
+from (
+select distinct	
+	time_sk
+	,SEG_PDH_BTL_IND
+	,count(*) as cases
+	,round(count(*)*0.2,1) as cases_holdout
+from perf_obs_point
+group by 1,2
+) as t1
+;
+quit;	
+
+proc sql;
+select 	
+cases_holdout 
+from (
+select distinct	
+	time_sk
+	,SEG_PDH_BTL_IND
+	,count(*) as cases
+	,round(count(*)*0.2,1) as cases_holdout
+from perf_obs_point
+group by 1,2
+) as t1
+;	
+quit;
+
+%put performing holdout is &cases_holdout_perf.;
+
+/*sampling of observations, not distinct accounts*/
+/*stratification on segmentation variable and time_sk*/
+proc surveyselect data=perf_obs_point method=srs n= (&cases_holdout_perf.) seed=123 out=sample_data_perf;	
+strata time_sk SEG_PDH_BTL_IND;	
+run;
+
+proc sql;
+create table perf_obs_point_holdout as 
+select
+	a.*
+	,case when b.account_rk is not null then 1 else 0 end as holdout_flag
+from perf_obs_point as a
+left join sample_data_perf as b
+on a.account_rk = b.account_rk
+and a.time_sk = b.time_sk
+;
+quit;
+
+/*******************************************************************************************************/
+/*******************************************************************************************************/
+
+PROC SORT DATA= &m_data_in.; BY account_rk;RUN;
+
+/*identify events and create segmentation flag*/
+data seg_step_1;
+set &m_data_in. (
+	keep =	time_sk 
+			default_time_sk 
+			resolution_time_sk 
+			OBS_LGD_MODEL_RES
+			account_rk 
+			default_sk 
+			perm_mod_descr 
+			utp_legal_order_ind 
+			asset_disposal_ind 
+			compromise_ind 
+			split_ind 
+			write_off_ind 
+			SEG_PDH_BTL_IND
+			mtg_type
+			lgd_default_ind
+			default_number
+			realised_lgd_modelling			
+			
+			x_app_index_ltv_adj
+			LGD_BALANCE_EUR_AMT
+			CURR_QUEUE_NO
+/*			COINS_LEGAL_FLAG	*/
+			IN_EXTRN_LEGAL_TABLE
+			);
+
+lag_ltv = lag1(x_app_index_ltv_adj);
+lag_balance = lag1(LGD_BALANCE_EUR_AMT);
+lag_default_sk = lag1(default_sk);
+
+by account_rk;
+
+length event_var $ 70 dflt_seg $ 16;
+
+
+retain seg_flag
+     event_var
+     litigation_ind
+;
+
+
+/* EASIEST TO CREATE A NONE RETAIN VARIABLE AND INPUT */
+if utp_legal_order_ind = 1 then do;
+     legal_this_month_ind = 1;
+end;
+
+else if CURR_QUEUE_NO IN ('1900', '1905') then do;
+	legal_this_month_ind = 1;
+end;
+/*
+else if COINS_LEGAL_FLAG = 1 then do;
+	legal_this_month_ind = 1;
+end;
+*/
+else if IN_EXTRN_LEGAL_TABLE = 1 then do;
+	legal_this_month_ind = 1;
+end;
+
+/*hard forbearance flags*/
+if UPCASE(perm_mod_descr) in
+(
+
+'ESF PRE BRIDGE TO DISPOSAL'
+,'LOW FIXED INTEREST RATE'
+,'NEGATIVE EQUITY TRADE DOWN' /*NA for EBS, can be identified using loan type in 84/85, Fiona is checking Data Source*/
+,'POSITIVE EQUITY'
+/*,'UNSECURED DEBT'*/
+,'VOLUNTARY SALE FOR LOSS'
+)
+then do;
+	seg_ind = 1;
+end;
+/*litigation indicator*/
+if coalesce(legal_this_month_ind,0) = 1 then do;
+	seg_ind = 1;
+end;
+
+/*cash flow based identificaiton*/
+if asset_disposal_ind = 1 then do;
+	seg_ind = 1;
+end;
+if compromise_ind = 1 then do;
+	seg_ind = 1;
+end;
+
+if split_ind = 1 then do;
+	seg_ind = 1;
+end;
+if write_off_ind = 1 then do;
+	seg_ind = 1;
+end;
+
+if not first.account_rk and lag_ltv > 0 and x_app_index_ltv_adj = 0 and lag_balance < 0 and lgd_balance_eur_amt < 0 then do;
+seg_ind = 1;
+end;
+
+/*create seg_flag*/
+if first.account_rk then do;
+seg_flag = .;
+end;
+
+if seg_ind = 1 then do;
+seg_flag = 1;
+end;
+
+if lgd_default_ind = 0 then do;
+seg_flag = .;
+end;
+
+/*field dflt_seg created with PDH, BTL and EVENT segments*/
+if coalesce(seg_flag,0) = 1 then do;
+dflt_seg = 'EVENT';
+end;
+
+if coalesce(seg_flag,0) = 0 and SEG_PDH_BTL_IND = 1 and lgd_default_ind = 1 then do;
+dflt_seg = 'PDH';
+end;
+
+if coalesce(seg_flag,0) = 0 and SEG_PDH_BTL_IND = 0 and lgd_default_ind = 1 then do;
+dflt_seg = 'BTL';
+end;
+
+/*field dflt_seg created with PDH, BTL and EVENT unresolved segments*/
+
+/*retain litigation*/
+if first.account_rk then do;
+     litigation_ind = coalesce(legal_this_month_ind,0);
+end;
+
+if coalesce(seg_flag,0) = 0 then do;
+	litigation_ind = 0;
+end;
+
+if coalesce(legal_this_month_ind,0) = 1 then do;
+     litigation_ind = 1;
+end;
+
+
+if first.account_rk then do;
+event_var = '';
+end;
+
+if coalesce(seg_flag,0) = 0 then do;
+event_var = '';
+end;
+
+if UPCASE(perm_mod_descr) in (
+	'ESF PRE BRIDGE TO DISPOSAL'
+	,'LOW FIXED INTEREST RATE'
+	,'NEGATIVE EQUITY TRADE DOWN'
+	,'POSITIVE EQUITY'
+/*	,'UNSECURED DEBT'*/
+	,'VOLUNTARY SALE FOR LOSS'
+) then do;
+event_var = perm_mod_descr;
+end;
+
+if litigation_ind = 1 then do;
+	event_var = 'LITIGATION';
+end;
+
+if compromise_ind = 1 then do;
+event_var = 'COMPROMISE';
+end;
+
+
+if write_off_ind = 1 then do;
+event_var = 'WRITE OFF';
+end;
+
+if split_ind = 1 then do;
+event_var = 'SPLIT';
+end;
+
+if asset_disposal_ind = 1 then do;
+event_var = 'ASSET DISPOSAL';
+end;
+
+run;
+
+/*subset the dataset to only observations, considered in model development*/
+proc sql;
+create table seg_step_2 as
+ 
+select * from seg_step_1 
+
+where 1=1
+	and lgd_default_ind = 1
+	and OBS_LGD_MODEL_RES = 1
+	and time_sk > 12
+
+order by account_rk,time_sk
+;
+quit;
+
+/*holdout input data for PDH*/
+proc sql;	
+create table input_data_pdh as	
+select distinct	
+	a.account_rk
+	,case 
+		when round((a.resolution_time_sk - a.default_time_sk)/12,1) ge 10 then 10
+		else round((a.resolution_time_sk - a.default_time_sk)/12,1)
+	end as yrs_to_resolution_adj
+	,count(a.account_rk) as observations
+
+from &m_data_in. as a
+
+left join seg_step_1 as b
+	on a.account_rk = b.account_rk
+	and a.time_sk = b.time_sk
+	
+where 1=1	
+	and a.lgd_default_ind = 1
+	and a.OBS_LGD_MODEL_RES = 1	
+	and b.dflt_seg = 'PDH'
+
+group by 1,2
+order by 2,1	
+;	
+quit;
+
+
+
+/*holdout input data for EVENTS*/
+proc sql;	
+create table input_data_evt as	
+select distinct	
+	a.account_rk
+	,case 
+		when round((a.resolution_time_sk - a.default_time_sk)/12,1) ge 10 then 10
+		else round((a.resolution_time_sk - a.default_time_sk)/12,1)
+	end as yrs_to_resolution_adj
+	,count(a.account_rk) as observations
+
+from &m_data_in. as a
+
+left join seg_step_1 as b
+	on a.account_rk = b.account_rk
+	and a.time_sk = b.time_sk
+
+where 1=1	
+	and a.lgd_default_ind = 1
+	and a.OBS_LGD_MODEL_RES = 1
+	and b.dflt_seg = 'EVENT'
+group by 1,2	
+order by 2,1	
+;
+quit;
+
+/* holdout PDH count */
+proc sql;
+select 	
+cases_holdout into :cases_holdout_pdh separated by ' '	
+from (	
+select distinct	
+	yrs_to_resolution_adj
+	,count(*) as cases
+	,round(count(*)*0.2,1) as cases_holdout
+from input_data_pdh
+group by 1
+) as t1	
+;
+quit;	
+
+%put holdout is &cases_holdout_pdh;	
+
+/* holdout EVT count */
+proc sql;
+select 	
+cases_holdout into :cases_holdout_evt separated by ' '	
+from (	
+select distinct	
+	yrs_to_resolution_adj
+	,count(*) as cases
+	,round(count(*)*0.2,1) as cases_holdout
+from input_data_evt
+group by 1
+) as t1	
+;	
+quit;
+
+%put holdout is &cases_holdout_evt;	
+
+
+/*run proc surveyselect, straticifation of years to resolution*/
+proc surveyselect data=input_data_pdh method=srs n= (&cases_holdout_pdh.) seed=123 out=sample_data_pdh;	
+strata yrs_to_resolution_adj;	
+run;
+
+
+proc surveyselect data=input_data_evt method=srs n= (&cases_holdout_evt.) seed=123 out=sample_data_evt;	
+strata yrs_to_resolution_adj;	
+run;	
+
+proc sql;
+create table holdout_ind as 
+select 
+	a.account_rk
+	,a.time_sk
+	,case
+		when a.dflt_seg = 'PDH' and b1.account_rk is not null then 1
+		when a.dflt_seg = 'EVENT' and b3.account_rk is not null then 1
+		else 0
+	end as holdout_ind
+
+from seg_step_2 as a
+left join sample_data_pdh as b1
+	on a.account_rk = b1.account_rk
+left join sample_data_evt as b3
+	on a.account_rk = b3.account_rk
+
+union
+
+select
+	account_rk
+	,time_sk
+	,holdout_flag as holdout_ind
+
+from perf_obs_point_holdout
+;
+quit;
+
+
+proc sql;
+CREATE TABLE &M_OUTPUT_DATASET. (index= (account_rk time_sk)) AS (
+SELECT
+	T1.*
+	,COALESCE(T2.holdout_ind, 0) as HOLDOUT_IND
+	,t3.event_var
+
+	,CASE 
+        WHEN T3.dflt_seg = 'EVENT'  THEN 'EVENT'
+        WHEN T3.dflt_seg = 'PDH'    THEN 'PDH_NP'
+        WHEN T3.dflt_seg = 'BTL'    THEN 'BTL_NP'
+        WHEN T3.SEG_PDH_BTL_IND = 1 THEN 'PDH_P'
+        WHEN T3.SEG_PDH_BTL_IND = 0 THEN 'BTL_P'
+    END AS SEG_LGD
+
+FROM
+	&m_data_in. as T1
+LEFT JOIN
+	holdout_ind as T2
+	ON T1.ACCOUNT_RK = T2.ACCOUNT_RK
+	AND T1.TIME_SK = T2.TIME_SK
+LEFT JOIN
+	seg_step_1 as T3
+	ON T1.ACCOUNT_RK = T3.ACCOUNT_RK
+	AND T1.TIME_SK = T3.TIME_SK
+);
+quit;
+
+
+proc sql;drop table EBSMOD.LGD_MOD_STEP1;
+
+/*#################################### end #################################*/
